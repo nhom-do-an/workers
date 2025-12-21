@@ -1,0 +1,97 @@
+version: '3.8'
+
+services:
+  workers:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ocm-workers
+    restart: unless-stopped
+    environment:
+      - RABBITMQ_URL=${RABBITMQ_URL:-amqp://guest:guest@rabbitmq:5672/}
+      - RABBITMQ_ORDER_QUEUE=${RABBITMQ_ORDER_QUEUE:-dwh.orders.v2}
+      - RABBITMQ_LINE_ITEM_QUEUE=${RABBITMQ_LINE_ITEM_QUEUE:-dwh.line_item}
+      - RABBITMQ_PREFETCH_COUNT=${RABBITMQ_PREFETCH_COUNT:-10}
+      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST:-clickhouse}
+      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT:-9000}
+      - CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE:-ocm_dev}
+      - CLICKHOUSE_USERNAME=${CLICKHOUSE_USERNAME:-default}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-}
+      - POSTGRES_HOST=${POSTGRES_HOST:-postgres}
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+      - POSTGRES_DATABASE=${POSTGRES_DATABASE:-ocm_dev}
+      - POSTGRES_USERNAME=${POSTGRES_USERNAME:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+    networks:
+      - ocm-network
+    depends_on:
+      - rabbitmq
+      - clickhouse
+      - postgres
+    healthcheck:
+      test: ["CMD", "pgrep", "workers"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-file: "5"
+        max-size: "10m"
+
+  # RabbitMQ (Optional - nếu chưa có)
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: ocm-rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - ocm-network
+
+  # ClickHouse (Optional - nếu chưa có)
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: ocm-clickhouse
+    restart: unless-stopped
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      - CLICKHOUSE_DB=ocm_dev
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    networks:
+      - ocm-network
+
+  # Postgres (Optional - nếu chưa có)
+  postgres:
+    image: postgres:15-alpine
+    container_name: ocm-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=ocm_dev
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - ocm-network
+
+networks:
+  ocm-network:
+    driver: bridge
+
+volumes:
+  rabbitmq_data:
+  clickhouse_data:
+  postgres_data:
