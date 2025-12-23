@@ -198,6 +198,10 @@ func (w *OrderWorker) syncOrderUpsert(ctx context.Context, evt models.OrderDWHEv
 		"delta_orders":        deltaOrders,
 		"event_type":          eventType,
 		"event_time":          ts,
+		"_version":            version,
+		"total_shipping_fee":  row.TotalShippingFee,
+		"total_line_item_fee": row.TotalLineFee,
+		"total_revenue":       row.TotalRevenue,
 	}
 
 	if err := w.chClient.InsertOrderDelta(ctx, deltaData); err != nil {
@@ -206,120 +210,6 @@ func (w *OrderWorker) syncOrderUpsert(ctx context.Context, evt models.OrderDWHEv
 
 	log.Printf("✓ Order event processed: order_id=%d, event=%s, delta_revenue=%.2f", row.OrderID, eventType, deltaRevenue)
 
-	// Sync line items for this order
-	return w.syncLineItemsForOrder(ctx, evt)
-}
-
-func (w *OrderWorker) syncLineItemsForOrder(ctx context.Context, evt models.OrderDWHEvent) error {
-	type liRow struct {
-		LineItemID int64
-		OrderID    int64
-		VariantID  int64
-		Quantity   int64
-		Price      float64
-		LocationID *int64
-		SourceID   *int64
-		StoreID    int64
-		OrderDate  time.Time
-	}
-
-	sql := `
-		SELECT
-			li.id as line_item_id,
-			li.reference_id as order_id,
-			li.variant_id,
-			li.quantity,
-			li.price,
-			o.location_id,
-			o.source_id,
-			o.store_id,
-			DATE(o.created_at) as order_date
-		FROM line_items li
-		INNER JOIN orders o ON o.id = li.reference_id AND li.reference_type = 'order'
-		WHERE o.id = ? AND o.deleted_at IS NULL
-	`
-
-	var rows []liRow
-	maxRetries := 3
-	retryDelay := 100 * time.Millisecond
-
-	for i := 0; i < maxRetries; i++ {
-		if i > 0 {
-			time.Sleep(retryDelay)
-			retryDelay *= 2
-		}
-
-		err := w.pgClient.DB().WithContext(ctx).Raw(sql, evt.OrderID).Scan(&rows).Error
-		if err == nil {
-			break
-		}
-
-		if i == maxRetries-1 {
-			return fmt.Errorf("failed to query line items for order %d after %d retries: %w", evt.OrderID, maxRetries, err)
-		}
-	}
-
-	if len(rows) == 0 {
-		log.Printf("No line items found for order %d", evt.OrderID)
-		return nil
-	}
-
-	// Insert line items into ClickHouse using batch
-	for _, r := range rows {
-		dateKey := r.OrderDate.Format("02012006")
-		locID := int64(0)
-		if r.LocationID != nil {
-			locID = *r.LocationID
-		}
-		sourceID := int64(0)
-		if r.SourceID != nil {
-			sourceID = *r.SourceID
-		}
-
-		totalRevenue := r.Price * float64(r.Quantity)
-
-		// Calculate delta based on event type
-		var deltaRevenue float64
-		var deltaSold int32
-		var eventTypeStr string
-
-		if evt.Event == "created" {
-			deltaRevenue = totalRevenue
-			deltaSold = int32(r.Quantity)
-			eventTypeStr = "create"
-		} else if evt.Event == "cancelled" {
-			deltaRevenue = -totalRevenue
-			deltaSold = -int32(r.Quantity)
-			eventTypeStr = "cancel"
-		} else {
-			// For update, we may need to query old values
-			// For simplicity, treat as create for now
-			deltaRevenue = totalRevenue
-			deltaSold = int32(r.Quantity)
-			eventTypeStr = "update"
-		}
-
-		lineItemData := map[string]interface{}{
-			"line_item_id":  r.LineItemID,
-			"order_id":      r.OrderID,
-			"date_key":      dateKey,
-			"location_key":  locID,
-			"source_key":    sourceID,
-			"store_key":     r.StoreID,
-			"variant_key":   r.VariantID,
-			"delta_revenue": deltaRevenue,
-			"delta_sold":    deltaSold,
-			"event_type":    eventTypeStr,
-			"event_time":    ts,
-		}
-
-		if err := w.chClient.InsertLineItemDelta(ctx, lineItemData); err != nil {
-			log.Printf("Failed to insert line item %d: %v", r.LineItemID, err)
-			// Continue with other line items
-		}
-	}
-
-	log.Printf("✓ Synced %d line items for order %d", len(rows), evt.OrderID)
 	return nil
 }
 
