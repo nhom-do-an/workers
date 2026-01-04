@@ -22,12 +22,6 @@ services:
       - POSTGRES_DATABASE=${POSTGRES_DATABASE:-ocm_dev}
       - POSTGRES_USERNAME=${POSTGRES_USERNAME:-postgres}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
-    networks:
-      - ocm-network
-    depends_on:
-      - rabbitmq
-      - clickhouse
-      - postgres
     healthcheck:
       test: ["CMD", "pgrep", "workers"]
       interval: 30s
@@ -38,60 +32,3 @@ services:
       options:
         max-file: "5"
         max-size: "10m"
-
-  # RabbitMQ (Optional - nếu chưa có)
-  rabbitmq:
-    image: rabbitmq:3-management-alpine
-    container_name: ocm-rabbitmq
-    restart: unless-stopped
-    ports:
-      - "5672:5672"
-      - "15672:15672"
-    environment:
-      - RABBITMQ_DEFAULT_USER=guest
-      - RABBITMQ_DEFAULT_PASS=guest
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
-    networks:
-      - ocm-network
-
-  # ClickHouse (Optional - nếu chưa có)
-  clickhouse:
-    image: clickhouse/clickhouse-server:latest
-    container_name: ocm-clickhouse
-    restart: unless-stopped
-    ports:
-      - "8123:8123"
-      - "9000:9000"
-    environment:
-      - CLICKHOUSE_DB=ocm_dev
-      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
-    volumes:
-      - clickhouse_data:/var/lib/clickhouse
-    networks:
-      - ocm-network
-
-  # Postgres (Optional - nếu chưa có)
-  postgres:
-    image: postgres:15-alpine
-    container_name: ocm-postgres
-    restart: unless-stopped
-    ports:
-      - "5432:5432"
-    environment:
-      - POSTGRES_DB=ocm_dev
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    networks:
-      - ocm-network
-
-networks:
-  ocm-network:
-    driver: bridge
-
-volumes:
-  rabbitmq_data:
-  clickhouse_data:
-  postgres_data:
