@@ -155,33 +155,31 @@ func (w *OrderWorker) syncOrderUpsert(ctx context.Context, evt models.OrderDWHEv
 		sourceID = *row.SourceID
 	}
 
-	// Calculate delta
+	// Calculate delta - always query old metrics to determine if this is create or update
 	var deltaRevenue, deltaShippingFee, deltaLineItemFee float64
 	var deltaOrders int32
 	var eventType string
 
-	if evt.Event == "created" {
+	// Always query old metrics regardless of event type to ensure correct delta calculation
+	oldMetrics, err := w.chClient.QueryOldOrderMetrics(ctx, row.OrderID)
+	if err == nil {
+		// Found old record - this is an update
+		deltaRevenue = row.TotalRevenue - oldMetrics["total_revenue"].(float64)
+		deltaShippingFee = row.TotalShippingFee - oldMetrics["total_shipping_fee"].(float64)
+		deltaLineItemFee = row.TotalLineFee - oldMetrics["total_line_item_fee"].(float64)
+		deltaOrders = 0 // No new order on update
+		eventType = "update"
+		log.Printf("Order %d update: old(rev=%.2f, ship=%.2f, line=%.2f) -> new(rev=%.2f, ship=%.2f, line=%.2f)",
+			row.OrderID, oldMetrics["total_revenue"].(float64), oldMetrics["total_shipping_fee"].(float64), oldMetrics["total_line_item_fee"].(float64),
+			row.TotalRevenue, row.TotalShippingFee, row.TotalLineFee)
+	} else {
+		// No old record found - this is a create (first time sync)
 		deltaRevenue = row.TotalRevenue
 		deltaShippingFee = row.TotalShippingFee
 		deltaLineItemFee = row.TotalLineFee
 		deltaOrders = 1
 		eventType = "create"
-	} else {
-		// Update: delta = new - old
-		oldMetrics, err := w.chClient.QueryOldOrderMetrics(ctx, row.OrderID)
-		if err == nil {
-			deltaRevenue = row.TotalRevenue - oldMetrics["total_revenue"].(float64)
-			deltaShippingFee = row.TotalShippingFee - oldMetrics["total_shipping_fee"].(float64)
-			deltaLineItemFee = row.TotalLineFee - oldMetrics["total_line_item_fee"].(float64)
-			deltaOrders = 0 // usually 0 for update
-		} else {
-			// If old value not found, treat as create
-			deltaRevenue = row.TotalRevenue
-			deltaShippingFee = row.TotalShippingFee
-			deltaLineItemFee = row.TotalLineFee
-			deltaOrders = 1
-		}
-		eventType = "update"
+		log.Printf("Order %d: first sync (no old record), treating as create", row.OrderID)
 	}
 
 	// Insert into Fact_Order_Delta
@@ -231,7 +229,7 @@ func (w *OrderWorker) syncOrderCancel(ctx context.Context, evt models.OrderDWHEv
 	}
 
 	sql := `
-		SELECT 
+		SELECT
 			DATE(o.created_at) as date_key,
 			o.location_id,
 			o.customer_id,
@@ -259,7 +257,7 @@ func (w *OrderWorker) syncOrderCancel(ctx context.Context, evt models.OrderDWHEv
 		sourceID = *keys.SourceID
 	}
 
-	// Insert negative delta
+	// 1. Insert NEGATIVE delta into Fact_Order_Delta ONLY (not Fact_Order)
 	deltaData := map[string]interface{}{
 		"order_id":            evt.OrderID,
 		"date_key":            dateKey,
@@ -270,15 +268,52 @@ func (w *OrderWorker) syncOrderCancel(ctx context.Context, evt models.OrderDWHEv
 		"delta_revenue":       -oldMetrics["total_revenue"].(float64),
 		"delta_shipping_fee":  -oldMetrics["total_shipping_fee"].(float64),
 		"delta_line_item_fee": -oldMetrics["total_line_item_fee"].(float64),
-		"delta_orders":        -int32(oldMetrics["total_count"].(int32)),
+		"delta_orders":        -int32(oldMetrics["total_count"].(uint32)),
 		"event_type":          "cancel",
 		"event_time":          ts,
 	}
 
-	if err := w.chClient.InsertOrderDelta(ctx, deltaData); err != nil {
+	if err := w.chClient.InsertOrderDeltaOnly(ctx, deltaData); err != nil {
 		return fmt.Errorf("failed to insert cancel delta: %w", err)
 	}
 
-	log.Printf("✓ Order cancelled: order_id=%d", evt.OrderID)
+	// 2. Mark order as deleted in Fact_Order (is_deleted = 1, total_count = 0)
+	if err := w.chClient.MarkOrderAsDeleted(ctx, evt.OrderID, version, ts); err != nil {
+		log.Printf("Warning: failed to mark order as deleted: %v", err)
+		// Don't return error - delta was already inserted
+	}
+
+	// 3. Cancel all line items for this order
+	lineItems, err := w.chClient.QueryAllLineItemsForOrder(ctx, evt.OrderID)
+	if err != nil {
+		log.Printf("Warning: failed to query line items for cancel: %v", err)
+	} else {
+		for lineItemID, li := range lineItems {
+			// Insert negative delta for each line item
+			liDelta := map[string]interface{}{
+				"line_item_id": lineItemID,
+				"order_id":     evt.OrderID,
+				"date_key":     li["date_key"],
+				"location_key": li["location_key"],
+				"source_key":   li["source_key"],
+				"store_key":    li["store_key"],
+				"variant_key":  li["variant_key"],
+				"delta_revenue": -li["total_revenue"].(float64),
+				"delta_sold":    -int32(li["total_sold"].(uint32)),
+				"event_type":   "cancel",
+				"event_time":   ts,
+			}
+			if err := w.chClient.InsertLineItemDelta(ctx, liDelta); err != nil {
+				log.Printf("Warning: failed to insert line item cancel delta for %d: %v", lineItemID, err)
+			}
+
+			// Mark line item as deleted
+			if err := w.chClient.MarkLineItemAsDeleted(ctx, lineItemID, version, ts); err != nil {
+				log.Printf("Warning: failed to mark line item %d as deleted: %v", lineItemID, err)
+			}
+		}
+	}
+
+	log.Printf("✓ Order cancelled: order_id=%d, line_items_cancelled=%d", evt.OrderID, len(lineItems))
 	return nil
 }

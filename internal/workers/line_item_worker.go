@@ -116,6 +116,7 @@ func (w *LineItemWorker) syncAllLineItemsForOrder(ctx context.Context, evt model
 		log.Printf("Failed to query old line items for order %d: %v, treating as new order", evt.OrderID, err)
 		oldLineItems = make(map[int64]map[string]interface{})
 	}
+	log.Printf("Order %d: found %d current line items in Postgres, %d old line items in ClickHouse", evt.OrderID, len(currentLineItems), len(oldLineItems))
 
 	// Build map of current line items for quick lookup
 	currentLineItemMap := make(map[int64]liRow)
@@ -124,12 +125,12 @@ func (w *LineItemWorker) syncAllLineItemsForOrder(ctx context.Context, evt model
 	}
 
 	// Process deletions: line items in ClickHouse but not in current Postgres data
-	for oldLineItemID, oldMetrics := range oldLineItems {
+	for oldLineItemID, _ := range oldLineItems {
 		if _, exists := currentLineItemMap[oldLineItemID]; !exists {
 			// Line item was deleted, insert negative delta
-			if err := w.insertDeleteDelta(ctx, oldLineItemID, evt.OrderID, oldMetrics, version, ts); err != nil {
-				log.Printf("Failed to insert delete delta for line_item %d: %v", oldLineItemID, err)
-			}
+			// if err := w.insertDeleteDelta(ctx, oldLineItemID, evt.OrderID, oldMetrics, version, ts); err != nil {
+			// 	log.Printf("Failed to insert delete delta for line_item %d: %v", oldLineItemID, err)
+			// }
 
 			// Mark as deleted in Fact_Line_Item
 			if err := w.chClient.MarkLineItemAsDeleted(ctx, oldLineItemID, version, ts); err != nil {
@@ -163,6 +164,8 @@ func (w *LineItemWorker) syncAllLineItemsForOrder(ctx context.Context, evt model
 			deltaRevenue = totalRevenue - oldRevenue
 			deltaSold = int32(row.Quantity) - oldSold
 			eventType = "update"
+			log.Printf("LineItem %d: old_revenue=%.2f, new_revenue=%.2f, old_sold=%d, new_sold=%d",
+				row.LineItemID, oldRevenue, totalRevenue, oldSold, row.Quantity)
 		} else {
 			// Create: all values are delta
 			deltaRevenue = totalRevenue
